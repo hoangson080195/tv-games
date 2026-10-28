@@ -1,0 +1,445 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Chém trái cây</title>
+<style>
+  html, body { margin:0; height:100%; background:#0b1020; overflow:hidden; font-family:system-ui, sans-serif; color:#fff; }
+  #wrap { position:fixed; inset:0; }
+  video { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; transform:scaleX(-1); filter:brightness(.55); }
+  canvas { position:absolute; inset:0; width:100%; height:100%; }
+  #hud { position:absolute; top:3vh; left:3vw; right:3vw; display:flex; justify-content:space-between; font-weight:800; text-shadow:0 2px 8px #000; pointer-events:none; }
+  #score { font-size:5vh; color:#ffd34d; }
+  #lives { font-size:5vh; }
+  #msg { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; text-align:center; text-shadow:0 3px 12px #000; }
+  #msg h1 { font-size:8vh; margin:0 0 1vh; }
+  #msg p { font-size:3.2vh; margin:.5vh; opacity:.92; max-width:80vw; }
+  .hide { display:none !important; }
+  #best { color:#9fe3ff; }
+  #camBtn { margin-top:3vh; padding:2vh 4vw; font:800 3.6vh system-ui, sans-serif; color:#fff; background:#2459dd; border:0; border-radius:2vh; cursor:pointer; }
+  #camBtn:hover, #camBtn:focus { background:#3d7bff; outline:4px solid #fff; }
+  #status { position:absolute; left:2vw; bottom:2vh; max-width:70vw; white-space:pre-wrap; font:1.8vh/1.35 monospace; color:#9fe3ff; opacity:.75; pointer-events:none; text-shadow:0 1px 3px #000; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <video id="v" autoplay muted playsinline></video>
+  <canvas id="c"></canvas>
+  <div id="hud"><div id="score">0</div><div id="lives">❤❤❤</div></div>
+  <div id="status"></div>
+  <div id="msg">
+    <h1 id="title">🍉 Chém trái cây</h1>
+    <p id="line1">Tối đa 4 người cùng chơi — đứng cách TV 1.5–2.5m, camera thấy cả người.</p>
+    <p id="line2">Vung tay chạm trái cây để chém, chém chung cộng điểm chung. Né bom 💣.</p>
+    <p id="best"></p>
+    <p id="hint" style="margin-top:3vh;font-size:2.6vh;opacity:.8">Đang bật camera…</p>
+    <button id="camBtn" type="button">📷 Bật camera</button>
+    <p style="font-size:2.2vh;opacity:.6">Chỉ con trỏ vào nút rồi bấm OK để bật camera — hoặc bấm OK ở chỗ khác để chơi bằng remote</p>
+  </div>
+</div>
+<script>
+// Report errors and progress to the PC (serve.py writes them to tv.log): LG's browser has no remote devtools.
+// Sent as an image GET (XHR POSTs from LG's browser stopped arriving) and also shown in the
+// on-screen status line so the player can read or photograph it.
+// ?log=<url> points the log at another server (GitHub Pages has no /log endpoint).
+var LOG_URL = (location.search.match(/[?&]log=([^&]+)/) || [])[1];
+LOG_URL = LOG_URL ? decodeURIComponent(LOG_URL) : '/log';
+function tvlog(m) {
+  m = String(m);
+  try { new Image().src = LOG_URL + '?m=' + encodeURIComponent(m) + '&t=' + Date.now(); } catch (e) {}
+  var s = document.getElementById('status');
+  if (s) { s.textContent = (s.textContent + '\n' + m).split('\n').slice(-4).join('\n'); }
+}
+window.onerror = function (msg, src, line, col) { tvlog('ERR ' + msg + ' @' + line + ':' + col); };
+window.onunhandledrejection = function (e) { tvlog('REJECT ' + (e.reason && (e.reason.stack || e.reason.message) || e.reason)); };
+tvlog('boot ' + navigator.userAgent + ' secure=' + window.isSecureContext + ' ' + innerWidth + 'x' + innerHeight);
+</script>
+<script>
+
+const video = document.getElementById('v');
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const scoreEl = document.getElementById('score');
+const livesEl = document.getElementById('lives');
+const msg = document.getElementById('msg');
+const hint = document.getElementById('hint');
+const bestEl = document.getElementById('best');
+
+let W = 0, H = 0;
+function resize() { W = canvas.width = innerWidth; H = canvas.height = innerHeight; }
+addEventListener('resize', resize); resize();
+
+// ---- game state ----
+let running = false, score = 0, lives = 3, fruits = [], slices = [], spawnT = 0, slashing = false;
+let best = +(localStorage.getItem('fruit_best') || 0);
+bestEl.textContent = best ? 'Điểm cao nhất: ' + best : '';
+const EMO = ['🍉','🍎','🍊','🍋','🍓','🥝','🍑','🍍'];
+// Blade sources: each tracked person contributes two wrists, plus the Magic Remote
+// pointer. Keys are "<person><side>" (e.g. "0L","0R","1L") and "P" for the pointer.
+// Each keeps a short trail; the segment between its last two points is the cutting edge.
+const hands = { P: { pts: [] } };
+const MAXP = 4;                              // people tracked at once
+// per-person colour (wrists share it); pointer is green
+const PCOL = ['255,180,120', '120,200,255', '200,150,255', '255,120,180'];
+function trail(k) { return (hands[k] || (hands[k] = { pts: [] })).pts; }
+
+// ---- Magic Remote pointer: its on-screen cursor is a blade too ----
+let pointerActive = false, pointerSeen = false;
+function onPointer(e) {
+  if (!pointerSeen) tvlog('first pointer ' + e.type + ' ' + Math.round(e.clientX) + ',' + Math.round(e.clientY));
+  pointerSeen = true; pointerActive = true;
+  const arr = hands.P.pts;
+  arr.push({ x: e.clientX, y: e.clientY }); if (arr.length > 8) arr.shift();
+  clearTimeout(onPointer._t);
+  onPointer._t = setTimeout(() => { pointerActive = false; hands.P.pts = []; }, 120);
+}
+addEventListener('pointermove', onPointer);
+addEventListener('mousemove', onPointer);
+
+function spawnFruit() {
+  const bomb = Math.random() < 0.16;
+  const x = W * (0.15 + Math.random() * 0.7);
+  const vy = -(H * 0.019 + Math.random() * H * 0.004);   // upward launch
+  fruits.push({
+    x, y: H + 60, vx: (W / 2 - x) * 0.004 + (Math.random() - 0.5) * 4,
+    vy, r: Math.min(W, H) * 0.09, emo: bomb ? '💣' : EMO[(Math.random() * EMO.length) | 0],
+    bomb, hit: false, rot: Math.random() * 6, vr: (Math.random() - 0.5) * 0.2
+  });
+}
+
+function addSlice(x, y, emo, bomb) {
+  for (let i = 0; i < 10; i++) {
+    const a = Math.random() * 6.28, s = 3 + Math.random() * 7;
+    slices.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s - 4, life: 1, c: bomb ? '#ff5a5a' : '#ffd34d' });
+  }
+  if (bomb) { sfx('bomb'); return; }
+  score += 1; scoreEl.textContent = score; if (score === 1) tvlog('first slice');
+  combo.n++; combo.t = 0; combo.x = x; combo.y = y;
+  sfx('slice', combo.n);
+}
+
+// ---- combo: fruit cut less than COMBO_GAP ms apart belong to one swing ----
+const COMBO_GAP = 350, COMBO_MIN = 3;
+const combo = { n: 0, t: 0, x: 0, y: 0 };
+let popups = [];
+function comboTick(dt) {
+  if (!combo.n) return;
+  combo.t += dt;
+  if (combo.t < COMBO_GAP) return;
+  if (combo.n >= COMBO_MIN) {
+    score += combo.n; scoreEl.textContent = score;   // bonus = fruit in the combo
+    popups.push({ x: combo.x, y: combo.y, text: 'COMBO ×' + combo.n + '  +' + combo.n, life: 1 });
+    sfx('combo', combo.n);
+  }
+  combo.n = 0;
+}
+
+// ---- sound: synthesised with Web Audio, no files. Created on the first OK (autoplay rules). ----
+let ac = null, noise = null;
+function audioInit() {
+  if (ac) { if (ac.state === 'suspended') ac.resume(); return; }
+  try {
+    ac = new (window.AudioContext || window.webkitAudioContext)();
+    noise = ac.createBuffer(1, ac.sampleRate, ac.sampleRate);
+    const d = noise.getChannelData(0);
+    for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  } catch (e) { tvlog('audio failed: ' + e.message); }
+}
+function tone(type, f0, f1, dur, vol, delay) {
+  const t = ac.currentTime + (delay || 0), o = ac.createOscillator(), g = ac.createGain();
+  o.type = type; o.frequency.setValueAtTime(f0, t); o.frequency.exponentialRampToValueAtTime(f1, t + dur);
+  g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  o.connect(g).connect(ac.destination); o.start(t); o.stop(t + dur);
+}
+function burst(filter, freq, dur, vol) {
+  const t = ac.currentTime, s = ac.createBufferSource(), f = ac.createBiquadFilter(), g = ac.createGain();
+  s.buffer = noise; f.type = filter; f.frequency.value = freq;
+  g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  s.connect(f).connect(g).connect(ac.destination); s.start(t); s.stop(t + dur);
+}
+function sfx(kind, n) {
+  if (!ac) return;
+  if (kind === 'slice') {          // swish + juicy thump, pitch climbs with the combo
+    burst('bandpass', 3000 + Math.min(n, 8) * 300, 0.09, 0.5);
+    tone('sine', 220 + Math.min(n, 8) * 40, 90, 0.12, 0.5);
+  } else if (kind === 'bomb') {
+    burst('lowpass', 500, 0.7, 0.9);
+    tone('sine', 90, 30, 0.6, 0.8);
+  } else if (kind === 'miss') {
+    tone('square', 300, 120, 0.25, 0.12);
+  } else if (kind === 'combo') {    // rising arpeggio, one note per fruit (max 6)
+    const notes = [523, 659, 784, 1047, 1319, 1568];
+    for (let i = 0; i < Math.min(n, 6); i++) tone('triangle', notes[i], notes[i], 0.16, 0.25, i * 0.06);
+  } else if (kind === 'start') {
+    tone('triangle', 440, 440, 0.12, 0.3); tone('triangle', 660, 660, 0.18, 0.3, 0.12);
+  } else if (kind === 'over') {
+    tone('triangle', 440, 220, 0.6, 0.35); tone('triangle', 330, 165, 0.8, 0.3, 0.2);
+  }
+}
+
+// segment vs circle hit test (the blade swept this frame)
+function segHit(ax, ay, bx, by, cx, cy, r) {
+  const dx = bx - ax, dy = by - ay, l2 = dx * dx + dy * dy || 1;
+  let t = ((cx - ax) * dx + (cy - ay) * dy) / l2; t = Math.max(0, Math.min(1, t));
+  const px = ax + t * dx, py = ay + t * dy;
+  return (px - cx) ** 2 + (py - cy) ** 2 <= r * r;
+}
+
+function loseLife() {
+  lives--; livesEl.textContent = '❤'.repeat(Math.max(0, lives)) + '🖤'.repeat(3 - Math.max(0, lives));
+  if (lives <= 0) gameOver();
+}
+
+function tick(dt) {
+  spawnT -= dt;
+  if (spawnT <= 0 && running) { spawnFruit(); spawnT = 520 - Math.min(300, score * 6); }
+
+  for (const f of fruits) {
+    f.x += f.vx; f.y += f.vy; f.vy += 0.42; f.rot += f.vr;
+    if (!f.hit && f.y - f.r > H && f.vy > 0) { f.hit = true; if (!f.bomb) { sfx('miss'); loseLife(); } }
+  }
+
+  // blades: check each source's latest segment against every fruit
+  let anyBlade = false;
+  for (const k in hands) {
+    const p = hands[k].pts;
+    if (p.length >= 2) {
+      anyBlade = true;
+      // Several pointer/wrist moves can land between two frames: test every segment of
+      // the trail, not just the newest one, or fast swings pass through fruit unscored.
+      for (let i = 1; i < p.length; i++) {
+        const a = p[i - 1], b = p[i];
+        if ((b.x - a.x) ** 2 + (b.y - a.y) ** 2 < (W * 0.005) ** 2) continue; // resting, not a swing
+        for (const f of fruits) {
+          if (!f.hit && segHit(a.x, a.y, b.x, b.y, f.x, f.y, f.r)) {
+            f.hit = true; addSlice(f.x, f.y, f.emo, f.bomb);
+            if (f.bomb) { loseLife(); flash = 1; }
+          }
+        }
+      }
+    }
+  }
+  slashing = anyBlade;
+
+  fruits = fruits.filter(f => !(f.hit) && f.y - f.r < H + 80 || (f.hit && f.y < H + 80 && !f.bomb && false));
+  fruits = fruits.filter(f => f.y - f.r < H + 120 && !f.hit);
+
+  for (const s of slices) { s.x += s.vx; s.y += s.vy; s.vy += 0.5; s.life -= dt / 600; }
+  slices = slices.filter(s => s.life > 0);
+
+  comboTick(dt);
+  for (const p of popups) { p.y -= 1.2; p.life -= dt / 1200; }
+  popups = popups.filter(p => p.life > 0);
+}
+
+let flash = 0;
+function drawEmoji(emo, x, y, size, rot) {
+  ctx.save(); ctx.translate(x, y); ctx.rotate(rot); ctx.font = size + 'px serif';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(emo, 0, 0); ctx.restore();
+}
+
+function render() {
+  ctx.clearRect(0, 0, W, H);
+  for (const s of slices) { ctx.globalAlpha = Math.max(0, s.life); ctx.fillStyle = s.c; ctx.beginPath(); ctx.arc(s.x, s.y, 6, 0, 6.28); ctx.fill(); }
+  ctx.globalAlpha = 1;
+  for (const f of fruits) drawEmoji(f.emo, f.x, f.y, f.r * 2, f.rot);
+
+  // blade trails
+  for (const k in hands) {
+    const p = hands[k].pts; if (p.length < 2) continue;
+    const rgb = k === 'P' ? '180,255,150' : PCOL[(+k[0]) % PCOL.length];
+    ctx.lineCap = 'round';
+    for (let i = 1; i < p.length; i++) {
+      ctx.strokeStyle = 'rgba(' + rgb + ',' + (i / p.length) + ')';
+      ctx.lineWidth = (i / p.length) * 22 + 2;
+      ctx.beginPath(); ctx.moveTo(p[i - 1].x, p[i - 1].y); ctx.lineTo(p[i].x, p[i].y); ctx.stroke();
+    }
+    const h = p[p.length - 1];
+    ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(h.x, h.y, 10, 0, 6.28); ctx.fill();
+  }
+  // combo popups
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  for (const p of popups) {
+    const size = Math.round(H * 0.06);
+    ctx.globalAlpha = Math.min(1, p.life * 1.5);
+    ctx.font = '900 ' + size + 'px system-ui, sans-serif';
+    ctx.lineWidth = size * 0.12; ctx.strokeStyle = '#7a2b00'; ctx.strokeText(p.text, p.x, p.y);
+    ctx.fillStyle = '#ffd34d'; ctx.fillText(p.text, p.x, p.y);
+  }
+  ctx.globalAlpha = 1;
+  if (flash > 0) { ctx.fillStyle = 'rgba(255,60,60,' + flash * 0.4 + ')'; ctx.fillRect(0, 0, W, H); flash -= 0.04; }
+}
+
+function gameOver() {
+  running = false;
+  sfx('over');
+  if (score > best) { best = score; localStorage.setItem('fruit_best', best); }
+  document.getElementById('title').textContent = '💥 Hết lượt!';
+  document.getElementById('line1').textContent = 'Điểm: ' + score;
+  document.getElementById('line2').textContent = '';
+  bestEl.textContent = 'Điểm cao nhất: ' + best;
+  hint.textContent = 'Giơ cả hai tay lên cao để chơi lại';
+  msg.classList.remove('hide');
+}
+
+function startGame() {
+  score = 0; lives = 3; fruits = []; slices = []; spawnT = 300; flash = 0;
+  scoreEl.textContent = 0; livesEl.textContent = '❤❤❤';
+  combo.n = 0; popups = [];
+  msg.classList.add('hide'); running = true;
+  sfx('start');
+  tvlog('game started');
+}
+
+// Hide the browser's address bar: go fullscreen on the first user gesture.
+function goFullscreen() {
+  const el = document.documentElement;
+  const fn = el.requestFullscreen || el.webkitRequestFullscreen || el.mozRequestFullScreen;
+  if (fn && !document.fullscreenElement && !document.webkitFullscreenElement) { try { fn.call(el); } catch (e) {} }
+}
+
+// Remote OK: with the Magic Remote cursor showing it arrives as a click, with the cursor
+// hidden (arrow keys used) as Enter. Either one goes fullscreen and starts / restarts.
+function okPressed(src) {
+  if (!okPressed.logged) { okPressed.logged = 1; tvlog('first OK via ' + src); }
+  audioInit();
+  // Fullscreen hides the browser's camera permission prompt (the request then hangs
+  // forever), so only go fullscreen once the camera request has been answered.
+  if (startCamera.settled) goFullscreen();
+  if (!running) startGame();
+}
+addEventListener('keydown', e => {
+  if (!loop.keyLogged) { loop.keyLogged = 1; tvlog('first key ' + e.keyCode + ' ' + e.key); }
+  if (e.keyCode === 13 || e.key === 'Enter') okPressed('key');
+});
+addEventListener('click', () => okPressed('click'));
+
+// The camera is requested only from this button, by a pointer click — exactly how the
+// WebRTC sample that did open the camera in this browser asks for it.
+document.getElementById('camBtn').addEventListener('click', e => {
+  e.stopPropagation();
+  audioInit();
+  tvlog('camera button clicked');
+  startCamera();
+});
+document.getElementById('camBtn').addEventListener('keydown', e => e.stopPropagation());
+
+// ---- pose tracking ----
+let landmarker, last = performance.now(), fpsT = 0, frames = 0, handsUp = 0;
+function pushPt(k, nx, ny) {
+  // landmark x is in the un-mirrored frame; mirror to screen space
+  const x = (1 - nx) * W, y = ny * H;
+  const arr = trail(k); arr.push({ x, y }); if (arr.length > 8) arr.shift();
+}
+
+function loop() {
+  const now = performance.now(), dt = now - last; last = now;
+  let res = null;
+  if (landmarker && video.readyState >= 2) {
+    try { res = landmarker.detectForVideo(video, now); }
+    catch (e) { if (!loop.warned) { loop.warned = 1; tvlog('detect failed: ' + (e.message || e)); } }
+  }
+  if (res) {
+    const poses = res.landmarks || [];
+    const seen = {};
+    let anyUp = false;
+    poses.forEach((lm, i) => {
+      // 15 = left wrist, 16 = right wrist, 11/12 = shoulders (MediaPipe pose)
+      if (lm[15] && lm[15].visibility > 0.4) { pushPt(i + 'L', lm[15].x, lm[15].y); seen[i + 'L'] = 1; }
+      if (lm[16] && lm[16].visibility > 0.4) { pushPt(i + 'R', lm[16].x, lm[16].y); seen[i + 'R'] = 1; }
+      if (lm[15] && lm[16] && lm[11] && lm[12] && lm[15].y < lm[11].y && lm[16].y < lm[12].y) anyUp = true;
+    });
+    // fade out trails of wrists not seen this frame (person left, or hand dropped)
+    for (const k in hands) if (k !== 'P' && !seen[k] && hands[k].pts.length) hands[k].pts.shift();
+    // restart when anyone raises both hands above their shoulders
+    if (!running) { handsUp = anyUp ? handsUp + dt : 0; if (handsUp > 500) startGame(); }
+  }
+  tick(Math.min(dt, 50));
+  render();
+  frames++; fpsT += dt;
+  if (fpsT > 1000) {
+    loop.sec = (loop.sec || 0) + 1;
+    if (loop.sec % 10 === 3) tvlog('fps ' + Math.round(frames * 1000 / fpsT) + ' pose=' + !!landmarker + ' people=' + (res && res.landmarks ? res.landmarks.length : 0) + ' running=' + running);
+    frames = 0; fpsT = 0;
+  }
+  requestAnimationFrame(loop);
+}
+
+function readyText() {
+  const cam = landmarker ? 'Giơ hai tay lên cao' : '';
+  const rem = 'bấm OK trên remote';
+  hint.textContent = (cam ? cam + ' hoặc ' : '') + rem + ' để bắt đầu';
+}
+
+const MP = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14';
+const MODEL = 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task';
+
+function remoteOnly(why) {
+  tvlog('remote-only: ' + why);
+  video.style.display = 'none';
+  document.getElementById('line1').textContent = 'Dùng remote: di chuyển con trỏ để vung kiếm.';
+  document.getElementById('line2').textContent = 'Vung nhanh qua trái cây để chém. Né bom 💣.';
+}
+
+function init() {
+  // The game runs on the remote pointer even if the camera or pose model is unavailable.
+  tvlog('game script running');
+  loop();
+  hint.textContent = 'Bấm OK trên remote để bật camera và bắt đầu';
+}
+
+// LG's browser only shows the camera prompt in response to a user gesture (the WebRTC
+// sample worked after pressing its button), so the camera starts on the first OK press.
+async function startCamera() {
+  if (startCamera.started) return;
+  startCamera.started = true;
+  tvlog('requesting camera');
+  try {
+    if (navigator.permissions) {
+      const st = await navigator.permissions.query({ name: 'camera' });
+      tvlog('camera permission state: ' + st.state);
+    }
+  } catch (e) { tvlog('permissions.query unsupported: ' + e.message); }
+  tvlog('📷 Nếu TV hỏi quyền camera, chọn Cho phép (Allow)');
+  const pending = setTimeout(() => tvlog('camera still pending after 10s'), 10000);
+  let stream;
+  try {
+    // Plain constraints, same as the WebRTC sample that worked in this browser.
+    stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+    clearTimeout(pending);
+    startCamera.settled = true;
+    video.srcObject = stream;
+    await new Promise(r => video.onloadeddata = r);
+    tvlog('camera ok ' + video.videoWidth + 'x' + video.videoHeight);
+    document.getElementById('camBtn').style.display = 'none';
+  } catch (e) {
+    clearTimeout(pending); startCamera.settled = true;
+    remoteOnly('camera ' + e.name + ' ' + e.message); return;
+  }
+
+  hint.textContent = 'Đang tải nhận dạng cử động…';
+  try {
+    const mp = await import(MP + '/vision_bundle.mjs');   // dynamic: a failure here must not kill the game
+    tvlog('mediapipe module ok');
+    const files = await mp.FilesetResolver.forVisionTasks(MP + '/wasm');
+    for (const delegate of ['GPU', 'CPU']) {
+      try {
+        landmarker = await mp.PoseLandmarker.createFromOptions(files, {
+          baseOptions: { modelAssetPath: MODEL, delegate }, runningMode: 'VIDEO', numPoses: MAXP
+        });
+        tvlog('pose ok delegate=' + delegate);
+        break;
+      } catch (e) { tvlog('pose ' + delegate + ' failed: ' + (e.message || e)); }
+    }
+    if (!landmarker) throw new Error('no delegate worked');
+  } catch (e) {
+    tvlog('pose load failed: ' + (e.stack || e.message || e));
+    hint.textContent = 'Không tải được nhận dạng cử động — chơi bằng remote';
+  }
+  readyText();
+}
+init();
+</script>
+</body>
+</html>
